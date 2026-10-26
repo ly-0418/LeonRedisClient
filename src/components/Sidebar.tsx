@@ -56,9 +56,6 @@ export function Sidebar({ onNew, onEdit }: SidebarProps) {
           <div className="sidebar-empty">
             <Server size={20} />
             <p>还没有保存的连接</p>
-            <button className="text-btn" onClick={onNew}>
-              新建第一个连接
-            </button>
           </div>
         )}
 

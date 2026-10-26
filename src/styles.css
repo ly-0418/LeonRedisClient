@@ -611,10 +611,14 @@ textarea:focus-visible {
 
 .sidebar-empty {
   display: flex;
+  flex: 1;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 8px;
-  padding: 34px 12px;
+  height: 100%;
+  min-height: 180px;
+  padding: 0 12px;
   color: var(--muted);
   text-align: center;
 }
@@ -623,19 +627,6 @@ textarea:focus-visible {
   margin: 0;
   color: var(--text-dim);
   font-size: calc(12px * var(--font-scale));
-}
-
-.text-btn {
-  padding: 0;
-  border: none;
-  color: var(--accent);
-  font-size: calc(12px * var(--font-scale));
-  background: none;
-  cursor: pointer;
-}
-
-.text-btn:hover {
-  text-decoration: underline;
 }
 
 .sidebar-warning {

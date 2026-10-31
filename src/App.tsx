@@ -96,6 +96,11 @@ export default function App() {
 
   useEffect(() => {
     const onContextMenu = (event: MouseEvent) => {
+      // 输入框保留系统右键菜单（复制/粘贴），其他区域禁用默认菜单。
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true']")) {
+        return;
+      }
       event.preventDefault();
     };
     window.addEventListener("contextmenu", onContextMenu);

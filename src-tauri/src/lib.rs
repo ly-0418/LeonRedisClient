@@ -73,6 +73,15 @@ fn install_data_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 pub fn run() {
     tauri::Builder::default()
+        // 必须是第一个插件：第二个实例启动时把已有窗口唤到前台，然后自己退出，
+        // 避免两个进程同时写 data 目录、抢同一个 WebView2 数据目录。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = install_data_dir()?;
@@ -117,23 +126,30 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_profiles,
+            commands::take_store_warning,
             commands::load_settings,
             commands::save_settings,
             commands::save_profile,
             commands::delete_profile,
             commands::test_connection,
             commands::connect,
+            commands::reconnect,
+            commands::connection_alive,
             commands::get_saved_password,
             commands::disconnect,
             commands::get_databases,
             commands::select_database,
             commands::flush_db,
+            commands::get_performance_summary,
             commands::analyze_performance,
+            commands::cancel_performance_scan,
             commands::export_data,
             commands::import_data,
             commands::set_read_only,
             commands::scan_keys,
-            commands::get_key_info,
+            commands::get_key_detail,
+            commands::get_key_bytes,
+            commands::run_command,
             commands::get_key_value,
             commands::create_key,
             commands::set_string,
@@ -141,16 +157,13 @@ pub fn run() {
             commands::hash_delete,
             commands::list_push,
             commands::list_set,
-            commands::list_remove,
+            commands::list_remove_at,
             commands::set_add,
             commands::set_remove,
             commands::zset_add,
             commands::zset_remove,
             commands::delete_key,
-            commands::expire_key,
-            commands::rename_key,
             commands::update_key,
-            commands::get_server_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LeonRedis");

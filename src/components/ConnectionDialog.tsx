@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Activity,
   AlertCircle,
   Check,
   CheckCircle2,
-  ChevronDown,
   Database,
   Eye,
   EyeOff,
   Loader2,
   PlugZap,
+  Save,
   X,
 } from "lucide-react";
 import { api, errorMessage } from "../lib/api";
@@ -105,8 +106,6 @@ export function ConnectionDialog({
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionSnapshot | null>(null);
   const [invalidFields, setInvalidFields] = useState<string[]>([]);
-  const [saveMenuOpen, setSaveMenuOpen] = useState(false);
-  const saveMenuRef = useRef<HTMLDivElement>(null);
   const passwordTouched = useRef(false);
 
   const title = mode === "create" ? "新建连接" : "编辑连接";
@@ -114,26 +113,11 @@ export function ConnectionDialog({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || busy) return;
-      if (saveMenuOpen) {
-        setSaveMenuOpen(false);
-        return;
-      }
       onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busy, onClose, saveMenuOpen]);
-
-  useEffect(() => {
-    if (!saveMenuOpen) return;
-    const onPointerDown = (event: PointerEvent) => {
-      if (!saveMenuRef.current?.contains(event.target as Node)) {
-        setSaveMenuOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [saveMenuOpen]);
+  }, [busy, onClose]);
 
   useEffect(() => {
     if (mode !== "edit" || !profile?.id || !profile.rememberPassword) return;
@@ -201,7 +185,6 @@ export function ConnectionDialog({
   };
 
   const handleConnect = async () => {
-    setSaveMenuOpen(false);
     const message = validate();
     if (message) {
       setError(message);
@@ -222,7 +205,6 @@ export function ConnectionDialog({
   };
 
   const handleSave = async () => {
-    setSaveMenuOpen(false);
     const message = validate();
     if (message) {
       setError(message);
@@ -432,47 +414,28 @@ export function ConnectionDialog({
               onClick={() => void handleTest()}
               disabled={busy}
             >
-              {busy ? <Loader2 size={14} className="spin" /> : null}
+              {busy ? (
+                <Loader2 size={14} className="spin" />
+              ) : (
+                <Activity size={14} />
+              )}
               测试连接
             </button>
           </div>
           <div className="dialog-footer-right">
-            <div className="save-group" ref={saveMenuRef}>
-              <button
-                type="submit"
-                className="btn primary save-main"
-                disabled={busy}
-              >
-                <span className="save-label">
-                  <span>保</span>
-                  <span>存</span>
-                </span>
-              </button>
-              <button
-                type="button"
-                className="btn primary save-toggle"
-                aria-haspopup="menu"
-                aria-expanded={saveMenuOpen}
-                title="更多保存选项"
-                disabled={busy}
-                onClick={() => setSaveMenuOpen((value) => !value)}
-              >
-                <ChevronDown size={14} />
-              </button>
-              {saveMenuOpen && (
-                <div className="save-menu" role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="save-menu-item"
-                    onClick={() => void handleConnect()}
-                  >
-                    <PlugZap size={14} />
-                    保存并连接
-                  </button>
-                </div>
-              )}
-            </div>
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => void handleConnect()}
+              disabled={busy}
+            >
+              <PlugZap size={14} />
+              保存并连接
+            </button>
+            <button type="submit" className="btn primary" disabled={busy}>
+              <Save size={14} />
+              保存
+            </button>
           </div>
         </div>
       </form>

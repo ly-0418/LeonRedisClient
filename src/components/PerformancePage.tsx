@@ -10,6 +10,7 @@ import {
   Network,
   RefreshCw,
   Server,
+  Square,
   Upload,
   X,
 } from "lucide-react";
@@ -18,6 +19,7 @@ import { api, errorMessage } from "../lib/api";
 import type {
   BigKeyInfo,
   PerformanceReport,
+  PerformanceSummary,
   ServerInfo,
 } from "../lib/types";
 import { useAppStore } from "../stores/appStore";
@@ -169,7 +171,6 @@ export function PerformancePage() {
   const connection = useAppStore((state) => state.connection);
   const readOnly = useAppStore((state) => state.readOnly);
   const refreshKeys = useAppStore((state) => state.refreshKeys);
-  const refreshServer = useAppStore((state) => state.refreshServer);
   const refreshDatabases = useAppStore((state) => state.refreshDatabases);
   const showNotice = useAppStore((state) => state.showNotice);
   const bigKeyThresholdBytes = useSettingsStore(
@@ -177,41 +178,67 @@ export function PerformancePage() {
   );
 
   const [report, setReport] = useState<PerformanceReport | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [summary, setSummary] = useState<PerformanceSummary | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [lastScanAt, setLastScanAt] = useState<Date | null>(null);
   const [busyAction, setBusyAction] = useState<"export" | "import" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [importPath, setImportPath] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
-  const analyzingRef = useRef(false);
+  const scanningRef = useRef(false);
 
-  const analyze = async (silent = false) => {
-    if (!activeProfileId || analyzingRef.current) return;
-    analyzingRef.current = true;
-    if (silent) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
+  // 轻量轮询：只读 INFO + PING，代价与键数量无关。
+  const refreshSummary = async () => {
+    if (!activeProfileId) return;
+    try {
+      const next = await api.getPerformanceSummary(activeProfileId);
+      setSummary(next);
+      setError(null);
+    } catch (err) {
+      setError(errorMessage(err));
     }
+  };
+
+  // 深度扫描：逐键统计内存和大 Key，只在进入页面、手动点击时执行。
+  const runDeepScan = async () => {
+    if (!activeProfileId || scanningRef.current) return;
+    scanningRef.current = true;
+    setScanning(true);
     setError(null);
     try {
       const result = await api.analyzePerformance(activeProfileId);
       setReport(result);
-      setLastUpdated(new Date());
+      setLastScanAt(new Date());
+    } catch (err) {
+      const message = errorMessage(err);
+      if (message.includes("扫描已取消")) {
+        showNotice("info", "已停止深度扫描");
+      } else {
+        setError(message);
+      }
+    } finally {
+      scanningRef.current = false;
+      setScanning(false);
+      setCancelling(false);
+    }
+  };
+
+  const cancelScan = async () => {
+    if (!activeProfileId || !scanning) return;
+    setCancelling(true);
+    try {
+      await api.cancelPerformanceScan(activeProfileId);
     } catch (err) {
       setError(errorMessage(err));
-    } finally {
-      analyzingRef.current = false;
-      setLoading(false);
-      setRefreshing(false);
     }
   };
 
   useEffect(() => {
-    void analyze();
+    void refreshSummary();
+    void runDeepScan();
     const timer = window.setInterval(() => {
-      void analyze(true);
+      void refreshSummary();
     }, 3000);
     return () => {
       window.clearInterval(timer);
@@ -219,8 +246,13 @@ export function PerformancePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProfileId]);
 
-  const rate = hitRate(report?.server);
-  const server = report?.server;
+  const rate = hitRate(summary?.server ?? report?.server);
+  const server = summary?.server ?? report?.server;
+  const latencyMs = summary?.latencyMs ?? report?.latencyMs ?? 0;
+  const totalKeys = summary?.totalKeys ?? report?.totalKeys ?? 0;
+  const liveKeys = new Map<number, number>();
+  for (const info of server?.keyspace ?? []) liveKeys.set(info.db, info.keys);
+
   const thresholdBytes = bigKeyThresholdBytes;
   const bigKeys = (report?.bigKeys ?? []).filter(
     (item) => item.memory >= thresholdBytes,
@@ -274,8 +306,9 @@ export function PerformancePage() {
         `已导入 ${result.keys} 个键（${result.databases} 个数据库）`,
       );
       setImportPath(null);
-      await Promise.all([refreshKeys(), refreshServer(), refreshDatabases()]);
-      await analyze();
+      await Promise.all([refreshKeys(), refreshDatabases()]);
+      await refreshSummary();
+      await runDeepScan();
     } catch (err) {
       const message = errorMessage(err);
       setError(message);
@@ -285,25 +318,42 @@ export function PerformancePage() {
     }
   };
 
+  const hasData = Boolean(report || summary);
+
   return (
     <section className="performance-page">
       <div className="performance-head">
         <div>
           <h2>性能分析</h2>
           <p>
-            扫描当前连接的全部数据库，统计内存与最大的键 · 每 3 秒自动刷新
-            {lastUpdated && ` · ${lastUpdated.toLocaleTimeString("zh-CN")}`}
+            指标每 3 秒自动刷新；内存明细与大 Key 需要深度扫描
+            {lastScanAt && ` · 上次深度扫描 ${lastScanAt.toLocaleTimeString("zh-CN")}`}
           </p>
         </div>
         <div className="performance-actions">
-          <button
-            className="btn ghost"
-            onClick={() => void analyze()}
-            disabled={loading}
-          >
-            <RefreshCw size={16} className={loading || refreshing ? "spin" : ""} />
-            重新扫描
-          </button>
+          {scanning ? (
+            <button
+              className="btn ghost"
+              onClick={() => void cancelScan()}
+              disabled={cancelling}
+            >
+              {cancelling ? (
+                <Loader2 size={16} className="spin" />
+              ) : (
+                <Square size={15} />
+              )}
+              停止扫描
+            </button>
+          ) : (
+            <button
+              className="btn ghost"
+              onClick={() => void runDeepScan()}
+              disabled={!activeProfileId}
+            >
+              <RefreshCw size={16} />
+              {report ? "重新深度扫描" : "深度扫描"}
+            </button>
+          )}
           <button
             className="btn ghost"
             onClick={() => void exportAll()}
@@ -335,12 +385,12 @@ export function PerformancePage() {
       <div className="performance-scroll">
         {error && <div className="perf-error">{error}</div>}
 
-        {loading && !report ? (
+        {!hasData ? (
           <div className="perf-loading">
             <Loader2 size={22} className="spin" />
-            <span>正在扫描全部数据库…</span>
+            <span>正在读取服务器信息…</span>
           </div>
-        ) : report ? (
+        ) : (
           <>
             <div className="perf-quad-grid">
               <section className="perf-quad perf-quad-deploy">
@@ -374,7 +424,7 @@ export function PerformancePage() {
                     label="Redis 内存用量"
                     value={
                       <AnimatedNumber
-                        value={server?.usedMemory ?? report.usedMemory}
+                        value={server?.usedMemory ?? report?.usedMemory ?? 0}
                         format={humanBytes}
                       />
                     }
@@ -385,7 +435,7 @@ export function PerformancePage() {
                         <>
                           键内存{" "}
                           <AnimatedNumber
-                            value={report.databasesMemory}
+                            value={report?.databasesMemory ?? 0}
                             format={humanBytes}
                           />
                         </>
@@ -397,17 +447,15 @@ export function PerformancePage() {
                     label="网络延迟"
                     value={
                       <AnimatedNumber
-                        value={report.latencyMs}
+                        value={latencyMs}
                         format={(value) => `${Math.round(value)} ms`}
                       />
                     }
                     meta={
                       <>
-                        <AnimatedNumber
-                          value={report.totalKeys}
-                          format={number}
-                        />{" "}
-                        键 · {report.databases.length} 个数据库
+                        <AnimatedNumber value={totalKeys} format={number} /> 键 ·{" "}
+                        {report?.databases.length ?? server?.keyspace.length ?? 0}{" "}
+                        个数据库
                       </>
                     }
                   />
@@ -485,12 +533,16 @@ export function PerformancePage() {
                   <h3>各数据库内存用量</h3>
                   <span>
                     <AnimatedNumber
-                      value={report.databasesMemory}
+                      value={report?.databasesMemory ?? 0}
                       format={humanBytes}
                     />
                   </span>
                 </div>
-                {report.databases.length === 0 ? (
+                {!report ? (
+                  <div className="perf-empty">
+                    {scanning ? "正在深度扫描内存明细…" : "尚未执行深度扫描"}
+                  </div>
+                ) : report.databases.length === 0 ? (
                   <div className="perf-empty">当前连接没有数据</div>
                 ) : (
                   <div className="perf-quad-table perf-db-table">
@@ -504,7 +556,10 @@ export function PerformancePage() {
                       <div className="perf-db-row" key={db.db}>
                         <span className="perf-db">db{db.db}</span>
                         <span>
-                          <AnimatedNumber value={db.keys} format={number} />
+                          <AnimatedNumber
+                            value={liveKeys.get(db.db) ?? db.keys}
+                            format={number}
+                          />
                         </span>
                         <span className="perf-memory">
                           <AnimatedNumber
@@ -537,7 +592,11 @@ export function PerformancePage() {
                     阈值 ≥ {formatThreshold(bigKeyThresholdBytes)} · 最多 20 个
                   </span>
                 </div>
-                {bigKeys.length === 0 ? (
+                {!report ? (
+                  <div className="perf-empty">
+                    {scanning ? "正在深度扫描大 Key…" : "尚未执行深度扫描"}
+                  </div>
+                ) : bigKeys.length === 0 ? (
                   <div className="perf-empty">没有达到阈值的键</div>
                 ) : (
                   <div className="perf-quad-table perf-big-table">
@@ -561,12 +620,10 @@ export function PerformancePage() {
             </div>
 
             <p className="perf-footnote">
-              内存来自 Redis MEMORY USAGE 的逐键统计，可能与 INFO
-              总内存存在开销差异。
+              内存来自 Redis MEMORY USAGE 的逐键统计，仅在深度扫描时更新，可能与
+              INFO 总内存存在开销差异。
             </p>
           </>
-        ) : (
-          <div className="perf-empty">暂无分析结果</div>
         )}
       </div>
 

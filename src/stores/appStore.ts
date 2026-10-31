@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, errorMessage } from "../lib/api";
+import { api, errorMessage, isTargetExistsError } from "../lib/api";
 import type {
   ConnectionProfile,
   ConnectionSnapshot,
@@ -10,7 +10,6 @@ import type {
   KeyValue,
   Notice,
   ProfileInput,
-  ServerInfo,
 } from "../lib/types";
 
 let noticeSeq = 0;
@@ -31,6 +30,39 @@ function mergeKeys(existing: KeyItem[], incoming: KeyItem[]): KeyItem[] {
   return merged;
 }
 
+/// 命令失败后先探活：连接真的断了就自动重连，命令本身的错误则原样抛出。
+///
+/// 读操作（SCAN / 取键 / 取库列表）重连后自动重试一次；写操作只重连不重试，
+/// 避免网络抖动导致同一条写命令被执行两次。
+async function runWithRecovery<T>(
+  profileId: string | null,
+  run: () => Promise<T>,
+  retry: boolean,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (!profileId) throw error;
+
+    // 探活本身失败时按「连接还在」处理，避免误触发重连。
+    const alive = await api.connectionAlive(profileId).catch(() => true);
+    if (alive) throw error;
+
+    try {
+      await api.reconnect(profileId);
+    } catch (reconnectError) {
+      throw new Error(
+        `连接已断开，自动重连失败：${errorMessage(reconnectError)}`,
+      );
+    }
+    useAppStore.getState().showNotice("info", "连接已断开，已自动重连");
+    if (!retry) throw error;
+    return await run();
+  }
+}
+
+export type UpdateKeyResult = "ok" | "target-exists" | "error";
+
 interface AppStore {
   booted: boolean;
   bootError: string | null;
@@ -38,7 +70,6 @@ interface AppStore {
   activeProfileId: string | null;
   connection: ConnectionSnapshot | null;
   connecting: boolean;
-  serverInfo: ServerInfo | null;
   databases: DatabaseOption[];
   maxDatabases: number;
   databaseLoading: boolean;
@@ -81,7 +112,6 @@ interface AppStore {
   selectKey: (key: string) => Promise<void>;
   reloadSelected: () => Promise<void>;
   loadMoreValue: () => Promise<void>;
-  refreshServer: () => Promise<void>;
 
   clearSelection: () => void;
 
@@ -92,7 +122,7 @@ interface AppStore {
   hashDelete: (field: string) => Promise<void>;
   listPush: (value: string, side: "left" | "right") => Promise<void>;
   listSet: (index: number, value: string) => Promise<void>;
-  listRemove: (value: string) => Promise<void>;
+  listRemove: (index: number) => Promise<void>;
   setAdd: (member: string) => Promise<void>;
   setRemove: (member: string) => Promise<void>;
   zsetAdd: (member: string, score: number) => Promise<void>;
@@ -101,7 +131,8 @@ interface AppStore {
   updateSelectedKey: (
     newKey: string,
     ttlSeconds: number | null,
-  ) => Promise<boolean>;
+    overwrite?: boolean,
+  ) => Promise<UpdateKeyResult>;
 }
 
 export const useAppStore = create<AppStore>((set, get) => {
@@ -113,11 +144,13 @@ export const useAppStore = create<AppStore>((set, get) => {
     return true;
   };
 
+  const recover = <T,>(run: () => Promise<T>, retry = true): Promise<T> =>
+    runWithRecovery(get().activeProfileId, run, retry);
+
   const resetData = () => {
     scanSeq += 1;
     detailSeq += 1;
     set({
-      serverInfo: null,
       databases: [],
       maxDatabases: 0,
       databaseLoading: false,
@@ -138,7 +171,8 @@ export const useAppStore = create<AppStore>((set, get) => {
     successMessage: string,
   ) => {
     try {
-      await action();
+      // 写操作只重连、不自动重试，避免重复执行。
+      await recover(action, false);
       await get().reloadSelected();
       get().showNotice("success", successMessage);
     } catch (error) {
@@ -153,7 +187,6 @@ export const useAppStore = create<AppStore>((set, get) => {
     activeProfileId: null,
     connection: null,
     connecting: false,
-    serverInfo: null,
     databases: [],
     maxDatabases: 0,
     databaseLoading: false,
@@ -180,6 +213,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       try {
         const profiles = await api.listProfiles();
         set({ profiles, booted: true, bootError: null });
+        const warning = await api.takeStoreWarning().catch(() => null);
+        if (warning) {
+          set({ bootError: warning });
+          get().showNotice("error", warning);
+        }
       } catch (error) {
         set({
           booted: true,
@@ -238,7 +276,7 @@ export const useAppStore = create<AppStore>((set, get) => {
           readOnly: false,
         });
         resetData();
-        await Promise.all([get().refreshKeys(), get().refreshServer()]);
+        await get().refreshKeys();
       } catch (error) {
         set({ connecting: false, connection: null, activeProfileId: null });
         throw error;
@@ -282,12 +320,17 @@ export const useAppStore = create<AppStore>((set, get) => {
       });
 
       try {
-        const page = await api.scanKeys(
+        const page = await runWithRecovery(
           profileId,
-          0,
-          get().pattern || "*",
-          300,
-          get().typeFilter || null,
+          () =>
+            api.scanKeys(
+              profileId,
+              0,
+              get().pattern || "*",
+              300,
+              get().typeFilter || null,
+            ),
+          true,
         );
         if (requestId !== scanSeq) return;
 
@@ -299,7 +342,6 @@ export const useAppStore = create<AppStore>((set, get) => {
           refreshingKeys: false,
         });
         void get().refreshDatabases();
-        void get().refreshServer();
 
         const currentKey = get().selectedKey;
         const nextKey =
@@ -324,12 +366,17 @@ export const useAppStore = create<AppStore>((set, get) => {
       const requestId = scanSeq;
       set({ scanning: true });
       try {
-        const page = await api.scanKeys(
+        const page = await runWithRecovery(
           profileId,
-          get().scanCursor,
-          get().pattern || "*",
-          300,
-          get().typeFilter || null,
+          () =>
+            api.scanKeys(
+              profileId,
+              get().scanCursor,
+              get().pattern || "*",
+              300,
+              get().typeFilter || null,
+            ),
+          true,
         );
         if (requestId !== scanSeq) return;
         set({
@@ -349,7 +396,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       const profileId = get().activeProfileId;
       if (!profileId) return;
       try {
-        const info = await api.getDatabases(profileId);
+        const info = await runWithRecovery(
+          profileId,
+          () => api.getDatabases(profileId),
+          true,
+        );
         if (get().activeProfileId !== profileId) return;
         set({
           databases: info.databases,
@@ -369,7 +420,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       detailSeq += 1;
       set({ databaseLoading: true });
       try {
-        const result = await api.selectDatabase(profileId, db);
+        const result = await runWithRecovery(
+          profileId,
+          () => api.selectDatabase(profileId, db),
+          true,
+        );
         if (get().activeProfileId !== profileId) return;
         const latest = get().connection;
         set({
@@ -385,10 +440,9 @@ export const useAppStore = create<AppStore>((set, get) => {
           keyInfo: null,
           keyValue: null,
           detailLoading: false,
-          serverInfo: null,
           databaseLoading: false,
         });
-        await Promise.all([get().refreshKeys(), get().refreshServer()]);
+        await get().refreshKeys();
       } catch (error) {
         set({ databaseLoading: false });
         get().showNotice("error", errorMessage(error));
@@ -403,7 +457,7 @@ export const useAppStore = create<AppStore>((set, get) => {
       scanSeq += 1;
       detailSeq += 1;
       try {
-        await api.flushDatabase(profileId);
+        await runWithRecovery(profileId, () => api.flushDatabase(profileId), false);
         set({
           keys: [],
           scanCursor: 0,
@@ -416,7 +470,7 @@ export const useAppStore = create<AppStore>((set, get) => {
           detailLoading: false,
         });
         get().showNotice("success", `db${db} 已清空`);
-        await Promise.all([get().refreshKeys(), get().refreshServer()]);
+        await get().refreshKeys();
         return true;
       } catch (error) {
         get().showNotice("error", errorMessage(error));
@@ -435,12 +489,17 @@ export const useAppStore = create<AppStore>((set, get) => {
         ...(sameKey ? {} : { keyInfo: null, keyValue: null }),
       });
       try {
-        const [info, value] = await Promise.all([
-          api.getKeyInfo(profileId, key),
-          api.getKeyValue(profileId, key, 0, 200),
-        ]);
+        const detail = await runWithRecovery(
+          profileId,
+          () => api.getKeyDetail(profileId, key, 0, 200),
+          true,
+        );
         if (requestId !== detailSeq) return;
-        set({ keyInfo: info, keyValue: value, detailLoading: false });
+        set({
+          keyInfo: detail.info,
+          keyValue: detail.value,
+          detailLoading: false,
+        });
       } catch (error) {
         if (requestId !== detailSeq) return;
         set({ detailLoading: false });
@@ -460,7 +519,18 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (!profileId || !key || !current || current.cursor === 0) return;
       const requestId = detailSeq;
       try {
-        const next = await api.getKeyValue(profileId, key, current.cursor, 200);
+        const next = await runWithRecovery(
+          profileId,
+          () =>
+            api.getKeyValue(
+              profileId,
+              key,
+              current.cursor,
+              200,
+              current.kind,
+            ),
+          true,
+        );
         if (requestId !== detailSeq || get().selectedKey !== key) return;
         set({
           keyValue: {
@@ -470,24 +540,6 @@ export const useAppStore = create<AppStore>((set, get) => {
         });
       } catch (error) {
         get().showNotice("error", errorMessage(error));
-      }
-    },
-
-    async refreshServer() {
-      const profileId = get().activeProfileId;
-      if (!profileId) return;
-      try {
-        const info = await api.getServerInfo(profileId);
-        if (get().activeProfileId !== profileId) return;
-        const current = get().connection;
-        set({
-          serverInfo: info,
-          connection: current
-            ? { ...current, dbSize: info.dbSize }
-            : current,
-        });
-      } catch {
-        // 状态栏信息不是关键路径，失败时保持旧值。
       }
     },
 
@@ -501,7 +553,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (!profileId) return;
       const next = !get().readOnly;
       try {
-        await api.setReadOnly(profileId, next);
+        await runWithRecovery(
+          profileId,
+          () => api.setReadOnly(profileId, next),
+          true,
+        );
         set({ readOnly: next });
         get().showNotice("info", next ? "已开启只读模式" : "已关闭只读模式");
       } catch (error) {
@@ -514,7 +570,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       const profileId = get().activeProfileId;
       if (!profileId) return false;
       try {
-        await api.createKey(profileId, input);
+        await runWithRecovery(
+          profileId,
+          () => api.createKey(profileId, input),
+          false,
+        );
         get().showNotice("success", "键已创建");
         await get().refreshKeys();
         await get().selectKey(input.key);
@@ -580,13 +640,13 @@ export const useAppStore = create<AppStore>((set, get) => {
       );
     },
 
-    async listRemove(value) {
+    async listRemove(index) {
       if (!writable()) return;
       const profileId = get().activeProfileId;
       const key = get().selectedKey;
       if (!profileId || !key) return;
       await runMutation(
-        () => api.listRemove(profileId, key, value).then(() => undefined),
+        () => api.listRemoveAt(profileId, key, index).then(() => undefined),
         "List 元素已删除",
       );
     },
@@ -638,7 +698,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       const key = get().selectedKey;
       if (!profileId || !key) return;
       try {
-        const deleted = await api.deleteKey(profileId, key);
+        const deleted = await runWithRecovery(
+          profileId,
+          () => api.deleteKey(profileId, key),
+          false,
+        );
         set({
           keys: get().keys.filter((item) => item.name !== key),
           selectedKey: null,
@@ -646,29 +710,27 @@ export const useAppStore = create<AppStore>((set, get) => {
           keyValue: null,
         });
         get().showNotice("success", deleted > 0 ? "键已删除" : "键不存在");
-        void get().refreshServer();
         void get().refreshDatabases();
       } catch (error) {
         get().showNotice("error", errorMessage(error));
       }
     },
 
-    async updateSelectedKey(newKey, ttlSeconds) {
-      if (!writable()) return false;
+    async updateSelectedKey(newKey, ttlSeconds, overwrite = false) {
+      if (!writable()) return "error";
       const profileId = get().activeProfileId;
       const oldKey = get().selectedKey;
-      if (!profileId || !oldKey) return false;
+      if (!profileId || !oldKey) return "error";
       const target = newKey.trim();
       if (!target) {
         get().showNotice("error", "键名不能为空");
-        return false;
+        return "error";
       }
       try {
-        const finalKey = await api.updateKey(
+        const finalKey = await runWithRecovery(
           profileId,
-          oldKey,
-          target,
-          ttlSeconds,
+          () => api.updateKey(profileId, oldKey, target, ttlSeconds, overwrite),
+          false,
         );
         set({
           keys: get().keys.map((item) =>
@@ -678,10 +740,12 @@ export const useAppStore = create<AppStore>((set, get) => {
         });
         await get().selectKey(finalKey);
         get().showNotice("success", "键信息已更新");
-        return true;
+        return "ok";
       } catch (error) {
-        get().showNotice("error", errorMessage(error));
-        return false;
+        const message = errorMessage(error);
+        if (isTargetExistsError(message)) return "target-exists";
+        get().showNotice("error", message);
+        return "error";
       }
     },
   };

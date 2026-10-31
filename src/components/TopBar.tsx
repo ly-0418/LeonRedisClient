@@ -1,6 +1,8 @@
-import { Gauge, ShieldCheck, ShieldOff } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Gauge, ShieldCheck, ShieldOff, Terminal } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isTauri } from "../lib/api";
+import { CommandConsole } from "./CommandConsole";
 import { SettingsMenu } from "./SettingsMenu";
 import { WindowControls } from "./WindowControls";
 import { useAppStore } from "../stores/appStore";
@@ -23,6 +25,11 @@ export function TopBar({
   const connecting = useAppStore((state) => state.connecting);
   const readOnly = useAppStore((state) => state.readOnly);
   const toggleReadOnly = useAppStore((state) => state.toggleReadOnly);
+  const [consoleOpen, setConsoleOpen] = useState(false);
+
+  useEffect(() => {
+    if (!connection) setConsoleOpen(false);
+  }, [connection]);
 
   return (
     <header className="topbar">
@@ -72,6 +79,14 @@ export function TopBar({
           {readOnly ? <ShieldCheck size={16} /> : <ShieldOff size={16} />}
         </button>
         <button
+          className={`icon-btn ${consoleOpen ? "active" : ""}`}
+          title="命令行"
+          onClick={() => setConsoleOpen((value) => !value)}
+          disabled={!connection}
+        >
+          <Terminal size={16} />
+        </button>
+        <button
           className={`icon-btn ${performanceOpen ? "active" : ""}`}
           title={performanceOpen ? "关闭性能分析" : "性能分析"}
           onClick={onTogglePerformance}
@@ -82,6 +97,8 @@ export function TopBar({
         <SettingsMenu />
         <WindowControls />
       </div>
+
+      {consoleOpen && <CommandConsole onClose={() => setConsoleOpen(false)} />}
     </header>
   );
 }

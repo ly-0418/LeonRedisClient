@@ -13,7 +13,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import type { KeyValue, ValueRow } from "../lib/types";
+import { api, errorMessage } from "../lib/api";
+import type { KeyBytes, KeyValue, ValueRow } from "../lib/types";
 import { useAppStore } from "../stores/appStore";
 import { Portal } from "./Portal";
 
@@ -37,7 +38,8 @@ function typeLabel(type: string) {
   return type === "none" ? "已过期" : type;
 }
 
-function formatTtl(ttl: number) {
+function formatTtl(ttl: number | null) {
+  if (ttl == null) return "-";
   if (ttl === -1) return "永久";
   if (ttl <= 0) return "已过期";
   if (ttl < 60) return `${ttl} 秒`;
@@ -88,6 +90,7 @@ function ModalShell({
 
 export function KeyDetail() {
   const connection = useAppStore((state) => state.connection);
+  const activeProfileId = useAppStore((state) => state.activeProfileId);
   const selectedKey = useAppStore((state) => state.selectedKey);
   const keyInfo = useAppStore((state) => state.keyInfo);
   const keyValue = useAppStore((state) => state.keyValue);
@@ -112,18 +115,23 @@ export function KeyDetail() {
   const [tab, setTab] = useState<DetailTab>("value");
   const [edit, setEdit] = useState<EditDialog>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [liveTtl, setLiveTtl] = useState(-2);
+  // 重命名撞上已存在的键时，先让用户确认再覆盖。
+  const [confirmOverwrite, setConfirmOverwrite] = useState<{
+    name: string;
+  } | null>(null);
+  const [liveTtl, setLiveTtl] = useState<number | null>(null);
 
   useEffect(() => {
     setTab("value");
     setEdit(null);
     setConfirmDelete(false);
+    setConfirmOverwrite(null);
   }, [selectedKey]);
 
   useEffect(() => {
     const ttl = keyInfo?.ttl;
     if (ttl == null) {
-      setLiveTtl(-2);
+      setLiveTtl(null);
       return;
     }
     setLiveTtl(ttl);
@@ -194,7 +202,7 @@ export function KeyDetail() {
   };
 
   const openEdit = () => {
-    const ttl = liveTtl > 0 ? liveTtl : -1;
+    const ttl = liveTtl != null && liveTtl > 0 ? liveTtl : -1;
     setEdit({
       name: selectedKey,
       ttlMode: ttl > 0 ? "custom" : "never",
@@ -202,7 +210,7 @@ export function KeyDetail() {
     });
   };
 
-  const submitEdit = async () => {
+  const submitEdit = async (overwrite = false) => {
     if (!edit) return;
     const name = edit.name.trim();
     if (!name) {
@@ -218,8 +226,13 @@ export function KeyDetail() {
       }
       ttlSeconds = Math.floor(seconds);
     }
-    const updated = await updateSelectedKey(name, ttlSeconds);
-    if (updated) setEdit(null);
+    const result = await updateSelectedKey(name, ttlSeconds, overwrite);
+    if (result === "ok") {
+      setEdit(null);
+      setConfirmOverwrite(null);
+    } else if (result === "target-exists") {
+      setConfirmOverwrite({ name });
+    }
   };
 
   return (
@@ -341,6 +354,12 @@ export function KeyDetail() {
               onZsetAdd={(member, score) => void zsetAdd(member, score)}
               onZsetRemove={(member) => void zsetRemove(member)}
               onLoadMore={() => void loadMoreValue()}
+              onLoadBytes={
+                activeProfileId
+                  ? () =>
+                      api.getKeyBytes(activeProfileId, selectedKey, 0, 4096)
+                  : undefined
+              }
             />
           </>
         )}
@@ -474,6 +493,39 @@ export function KeyDetail() {
         </ModalShell>
       )}
 
+      {confirmOverwrite && (
+        <ModalShell
+          title="目标键已存在"
+          onClose={() => setConfirmOverwrite(null)}
+        >
+          <div className="modal-body">
+            <div className="danger-box">
+              <AlertTriangle size={18} />
+              <div>
+                <p>键名「{confirmOverwrite.name}」已经存在。</p>
+                <span>
+                  继续会覆盖并删除原有的同名键，此操作不可撤销。如需保留，请先修改键名。
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="modal-footer">
+            <button
+              className="btn ghost"
+              onClick={() => setConfirmOverwrite(null)}
+            >
+              取消
+            </button>
+            <button
+              className="btn danger"
+              onClick={() => void submitEdit(true)}
+            >
+              覆盖并重命名
+            </button>
+          </div>
+        </ModalShell>
+      )}
+
       {confirmDelete && (
         <ModalShell title="删除键" onClose={() => setConfirmDelete(false)}>
           <div className="modal-body">
@@ -536,12 +588,13 @@ interface ValueEditorProps {
   onHashDelete: (field: string) => void;
   onListPush: (value: string, side: "left" | "right") => void;
   onListSet: (index: number, value: string) => void;
-  onListRemove: (value: string) => void;
+  onListRemove: (index: number) => void;
   onSetAdd: (member: string) => void;
   onSetRemove: (member: string) => void;
   onZsetAdd: (member: string, score: number) => void;
   onZsetRemove: (member: string) => void;
   onLoadMore: () => void;
+  onLoadBytes?: () => Promise<KeyBytes>;
 }
 
 function ValueEditor(props: ValueEditorProps) {
@@ -560,6 +613,7 @@ function ValueEditor(props: ValueEditorProps) {
         truncated={keyValue.truncated}
         readOnly={readOnly}
         onSave={props.onSaveString}
+        onLoadBytes={props.onLoadBytes}
       />
     );
   }
@@ -630,19 +684,51 @@ function ValueEditor(props: ValueEditorProps) {
   );
 }
 
+function decodeBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+/// redis-cli 风格的十六进制 + ASCII 视图，用来查看二进制/非 UTF-8 内容。
+function toHexDump(bytes: Uint8Array): string {
+  const lines: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 16) {
+    const chunk = bytes.subarray(offset, offset + 16);
+    const hex = Array.from(chunk)
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join(" ");
+    const ascii = Array.from(chunk)
+      .map((byte) => (byte >= 32 && byte < 127 ? String.fromCharCode(byte) : "."))
+      .join("");
+    lines.push(
+      `${offset.toString(16).padStart(8, "0")}  ${hex.padEnd(47, " ")}  |${ascii}|`,
+    );
+  }
+  return lines.join("\n");
+}
+
 function StringEditor({
   value,
   truncated,
   readOnly,
   onSave,
+  onLoadBytes,
 }: {
   value: string;
   truncated: boolean;
   readOnly: boolean;
   onSave: (value: string) => void;
+  onLoadBytes?: () => Promise<KeyBytes>;
 }) {
   const [draft, setDraft] = useState(value);
   const [formatError, setFormatError] = useState<string | null>(null);
+  const [mode, setMode] = useState<"text" | "hex">("text");
+  const [raw, setRaw] = useState<KeyBytes | null>(null);
+  const [rawError, setRawError] = useState<string | null>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
 
@@ -653,6 +739,21 @@ function StringEditor({
     setDraft(value);
     setFormatError(null);
   }, [value]);
+
+  useEffect(() => {
+    if (mode !== "hex" || raw || !onLoadBytes) return;
+    let cancelled = false;
+    onLoadBytes()
+      .then((bytes) => {
+        if (!cancelled) setRaw(bytes);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setRawError(errorMessage(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, raw, onLoadBytes]);
 
   const syncScroll = () => {
     if (editorRef.current && gutterRef.current) {
@@ -685,29 +786,74 @@ function StringEditor({
           <span className="editor-size">{bytes} bytes</span>
         </span>
         <div className="editor-toolbar-actions">
+          {onLoadBytes && (
+            <div className="editor-mode" role="group" aria-label="显示方式">
+              <button
+                type="button"
+                className={mode === "text" ? "active" : ""}
+                onClick={() => setMode("text")}
+              >
+                文本
+              </button>
+              <button
+                type="button"
+                className={mode === "hex" ? "active" : ""}
+                onClick={() => setMode("hex")}
+              >
+                Hex
+              </button>
+            </div>
+          )}
           <button
             className="btn ghost small"
             onClick={formatJson}
-            disabled={readOnly || truncated}
+            disabled={readOnly || truncated || mode === "hex"}
           >
             <Braces size={13} /> 格式化 JSON
           </button>
           <button
             className="btn primary small"
-            disabled={!dirty || readOnly || truncated}
+            disabled={!dirty || readOnly || truncated || mode === "hex"}
             onClick={() => onSave(draft)}
           >
             <Save size={13} /> 保存
           </button>
         </div>
       </div>
-      {truncated && (
+      {truncated && mode === "text" && (
         <div className="inline-warning">
           <AlertTriangle size={15} />
           值超过 64 KB，当前仅展示前 64 KB，已禁用直接编辑以避免覆盖原始数据。
         </div>
       )}
-      <div className="string-editor-shell">
+      {mode === "hex" ? (
+        <div className="hex-shell">
+          {rawError && (
+            <div className="inline-warning">
+              <AlertTriangle size={15} />
+              {rawError}
+            </div>
+          )}
+          {raw ? (
+            <>
+              <pre className="hex-dump" aria-label="十六进制内容">
+                {toHexDump(decodeBase64(raw.base64))}
+              </pre>
+              <div className="editor-footer">
+                <span>
+                  共 {raw.total} bytes
+                  {raw.truncated ? "，仅显示前 4 KB" : ""}
+                </span>
+                <span>只读视图，切换到「文本」后可编辑</span>
+              </div>
+            </>
+          ) : (
+            !rawError && <div className="hex-loading">正在读取原始字节…</div>
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="string-editor-shell">
         <div
           ref={gutterRef}
           className="line-numbers"
@@ -734,10 +880,12 @@ function StringEditor({
           }}
         />
       </div>
-      <div className="editor-footer">
-        <span>{formatError ?? (dirty ? "有未保存的修改" : "内容未修改")}</span>
-        <span>{readOnly ? "只读模式已开启" : "修改后点击保存"}</span>
-      </div>
+          <div className="editor-footer">
+            <span>{formatError ?? (dirty ? "有未保存的修改" : "内容未修改")}</span>
+            <span>{readOnly ? "只读模式已开启" : "修改后点击保存"}</span>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1034,7 +1182,7 @@ function ListEditor({
   readOnly: boolean;
   onPush: (value: string, side: "left" | "right") => void;
   onSet: (index: number, value: string) => void;
-  onRemove: (value: string) => void;
+  onRemove: (index: number) => void;
 }) {
   const [value, setValue] = useState("");
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -1133,7 +1281,7 @@ function ListEditor({
                       className="icon-btn tiny danger"
                       title="删除元素"
                       disabled={readOnly}
-                      onClick={() => onRemove(row.value)}
+                      onClick={() => onRemove(index)}
                     >
                       <Trash2 size={12} />
                     </button>

@@ -1,6 +1,12 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
+/**
+ * 只在悬停时滚动，平时用省略号静态展示。
+ *
+ * 之前连接卡片的名称和地址两行一直在滚动，侧栏看起来一直在动、
+ * 也读不出完整的主机地址；现在静止时截断并保留悬浮提示，悬停才滚动。
+ */
 export function MarqueeText({
   text,
   className = "",
@@ -11,6 +17,7 @@ export function MarqueeText({
   const containerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLSpanElement>(null);
   const [overflow, setOverflow] = useState(false);
+  const [hovered, setHovered] = useState(false);
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -33,6 +40,7 @@ export function MarqueeText({
     };
   }, [text]);
 
+  const scrolling = overflow && hovered;
   const style = {
     "--marquee-duration": `${Math.max(7, text.length * 0.32)}s`,
   } as CSSProperties;
@@ -40,14 +48,16 @@ export function MarqueeText({
   return (
     <div
       ref={containerRef}
-      className={`marquee ${overflow ? "is-scrolling" : ""} ${className}`}
+      className={`marquee ${scrolling ? "is-scrolling" : ""} ${className}`}
       title={text}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
     >
       <div className="marquee-track" style={style}>
         <span className="marquee-copy">
           <span ref={contentRef}>{text}</span>
         </span>
-        {overflow && (
+        {scrolling && (
           <span className="marquee-copy" aria-hidden="true">
             {text}
           </span>

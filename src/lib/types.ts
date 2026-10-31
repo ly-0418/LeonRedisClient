@@ -99,6 +99,13 @@ export interface PerformanceReport {
   bigKeys: BigKeyInfo[];
 }
 
+/// 性能页每 3 秒轮询的轻量指标，只读 INFO + PING。
+export interface PerformanceSummary {
+  server: ServerInfo;
+  latencyMs: number;
+  totalKeys: number;
+}
+
 export interface ExportResult {
   path: string;
   databases: number;
@@ -134,6 +141,26 @@ export interface KeyValue {
   total: number;
   truncated: boolean;
   message?: string | null;
+}
+
+/// 键信息与值一次 IPC 取回。
+export interface KeyDetailBundle {
+  info: KeyInfo;
+  value: KeyValue;
+}
+
+/// 命令行面板的一次执行结果。
+export interface CommandResult {
+  output: string;
+  elapsedMs: number;
+}
+
+/// 十六进制查看用的原始字节（Base64）。
+export interface KeyBytes {
+  base64: string;
+  total: number;
+  offset: number;
+  truncated: boolean;
 }
 
 export interface DbInfo {

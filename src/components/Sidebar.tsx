@@ -8,11 +8,12 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import { errorMessage } from "../lib/api";
+import { isAuthError, errorMessage } from "../lib/api";
 import type { ConnectionProfile } from "../lib/types";
 import { useAppStore } from "../stores/appStore";
 import { MarqueeText } from "./MarqueeText";
 import { DeleteConnectionDialog } from "./DeleteConnectionDialog";
+import { PasswordPromptDialog } from "./PasswordPromptDialog";
 
 interface SidebarProps {
   onNew: () => void;
@@ -31,12 +32,19 @@ export function Sidebar({ onNew, onEdit }: SidebarProps) {
   const [deleteTarget, setDeleteTarget] = useState<ConnectionProfile | null>(
     null,
   );
+  // 认证失败时弹出补密码的弹框，而不是只丢一条 NOAUTH 错误。
+  const [authTarget, setAuthTarget] = useState<ConnectionProfile | null>(null);
 
   const connectProfile = (profile: ConnectionProfile) => {
     if (connecting) return;
     if (activeProfileId === profile.id && connection) return;
     void connectTo(profile.id).catch((error) => {
-      showNotice("error", errorMessage(error));
+      const message = errorMessage(error);
+      if (isAuthError(message)) {
+        setAuthTarget(profile);
+        return;
+      }
+      showNotice("error", message);
     });
   };
 
@@ -148,6 +156,13 @@ export function Sidebar({ onNew, onEdit }: SidebarProps) {
         <DeleteConnectionDialog
           profile={deleteTarget}
           onClose={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {authTarget && (
+        <PasswordPromptDialog
+          profile={authTarget}
+          onClose={() => setAuthTarget(null)}
         />
       )}
     </aside>

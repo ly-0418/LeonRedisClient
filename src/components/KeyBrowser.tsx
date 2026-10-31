@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   KeyRound,
@@ -8,6 +8,7 @@ import {
   Search,
   X,
 } from "lucide-react";
+import type { KeyItem } from "../lib/types";
 import { useAppStore } from "../stores/appStore";
 import { DbSelector } from "./DbSelector";
 import { NewKeyDialog } from "./NewKeyDialog";
@@ -39,6 +40,107 @@ const typeLabel: Record<string, string> = {
   zset: "ZSet",
   stream: "Stream",
 };
+
+/// 首次渲染时的行高估算，渲染后按真实行高测量并校正。
+const KEY_ROW_ESTIMATE = 32;
+const OVERSCAN = 8;
+
+/**
+ * 窗口化的键列表：只挂载可见区域的若干行。
+ *
+ * 十几万个键时仍然只渲染几十个 DOM 节点，「继续加载」也不会让界面越来越卡。
+ */
+function VirtualKeyList({
+  keys,
+  selectedKey,
+  refreshing,
+  onSelect,
+  children,
+}: {
+  keys: KeyItem[];
+  selectedKey: string | null;
+  refreshing: boolean;
+  onSelect: (name: string) => void;
+  children: React.ReactNode;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [rowHeight, setRowHeight] = useState(KEY_ROW_ESTIMATE);
+
+  useLayoutEffect(() => {
+    const element = listRef.current;
+    if (!element) return;
+    const measure = () => setViewportHeight(element.clientHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useLayoutEffect(() => {
+    const row = listRef.current?.querySelector<HTMLElement>(".key-row");
+    if (!row) return;
+    const style = window.getComputedStyle(row);
+    const measured =
+      row.offsetHeight +
+      (parseFloat(style.marginTop) || 0) +
+      (parseFloat(style.marginBottom) || 0);
+    if (measured > 0 && Math.abs(measured - rowHeight) > 0.5) {
+      setRowHeight(measured);
+    }
+  }, [keys.length, rowHeight]);
+
+  const totalHeight = keys.length * rowHeight;
+  const visibleCount = Math.ceil(viewportHeight / rowHeight) + OVERSCAN * 2;
+  const start =
+    keys.length === 0
+      ? 0
+      : Math.max(
+          0,
+          Math.min(keys.length - 1, Math.floor(scrollTop / rowHeight) - OVERSCAN),
+        );
+  const end = Math.min(keys.length, start + visibleCount);
+  const slice = keys.slice(start, end);
+
+  return (
+    <div
+      ref={listRef}
+      className={`key-list ${refreshing ? "is-refreshing" : ""}`}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      {children}
+      {keys.length > 0 && (
+        <div style={{ height: totalHeight, position: "relative" }}>
+          <div style={{ transform: `translateY(${start * rowHeight}px)` }}>
+            {slice.map((key) => (
+              <button
+                key={key.name}
+                className={`key-row ${
+                  selectedKey === key.name ? "selected" : ""
+                }`}
+                onClick={() => onSelect(key.name)}
+                title={key.name}
+              >
+                <KeyRound size={13} />
+                <span className="key-name">{key.name}</span>
+                {key.keyType && key.keyType !== "unknown" && (
+                  <span
+                    className={`type-badge key-type ${
+                      typeClass[key.keyType] ?? ""
+                    }`}
+                  >
+                    {typeLabel[key.keyType] ?? key.keyType}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function KeyBrowser() {
   const connection = useAppStore((state) => state.connection);
@@ -135,7 +237,12 @@ export function KeyBrowser() {
         ))}
       </div>
 
-      <div className={`key-list ${refreshingKeys ? "is-refreshing" : ""}`}>
+      <VirtualKeyList
+        keys={keys}
+        selectedKey={selectedKey}
+        refreshing={refreshingKeys}
+        onSelect={(name) => void selectKey(name)}
+      >
         {!connection && (
           <div className="panel-empty">
             <KeyRound size={26} />
@@ -158,28 +265,7 @@ export function KeyBrowser() {
             <span>尝试修改匹配模式或类型筛选</span>
           </div>
         )}
-
-        {keys.map((key) => (
-          <button
-            key={key.name}
-            className={`key-row ${selectedKey === key.name ? "selected" : ""}`}
-            onClick={() => void selectKey(key.name)}
-            title={key.name}
-          >
-            <KeyRound size={13} />
-            <span className="key-name">{key.name}</span>
-            {key.keyType && key.keyType !== "unknown" && (
-              <span
-                className={`type-badge key-type ${
-                  typeClass[key.keyType] ?? ""
-                }`}
-              >
-                {typeLabel[key.keyType] ?? key.keyType}
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
+      </VirtualKeyList>
 
       {connection && !scanDone && (
         <div className="key-panel-footer">

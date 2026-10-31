@@ -228,3 +228,38 @@ pub struct ServerInfo {
     pub db_size: u64,
     pub keyspace: Vec<DbInfo>,
 }
+
+/// 性能页每 3 秒轮询的轻量指标，只读 `INFO` + `PING`，不逐键统计内存。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerformanceSummary {
+    pub server: ServerInfo,
+    pub latency_ms: u64,
+    pub total_keys: u64,
+}
+
+/// 一次 IPC 同时返回键的基本信息和值，避免重复 `TYPE` 与多次往返。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDetailBundle {
+    pub info: KeyInfo,
+    pub value: KeyValue,
+}
+
+/// 命令行面板的单次执行结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandResult {
+    pub output: String,
+    pub elapsed_ms: u64,
+}
+
+/// 十六进制查看用的原始字节（Base64 传输，避免 UTF-8 有损转换）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyBytes {
+    pub base64: String,
+    pub total: u64,
+    pub offset: u64,
+    pub truncated: bool,
+}

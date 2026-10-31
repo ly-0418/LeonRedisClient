@@ -24,6 +24,8 @@ export interface AppSettings {
 }
 
 const LEGACY_STORAGE_KEY = "leonredis.settings.v1";
+/// 同步缓存：settings.json 需要异步 IPC 读取，首帧先用它渲染，避免主题闪烁。
+const CACHE_STORAGE_KEY = "leonredis.settings.cache";
 
 const defaults: AppSettings = {
   themeMode: "system",
@@ -158,7 +160,26 @@ function applySettings(settings: AppSettings) {
   root.style.colorScheme = resolved;
 }
 
+function readCachedSettings(): AppSettings | null {
+  try {
+    const raw = localStorage.getItem(CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    return normalizeSettings(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function cacheSettings(settings: AppSettings) {
+  try {
+    localStorage.setItem(CACHE_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // 缓存失败只影响下次启动的首帧，不影响功能。
+  }
+}
+
 function persistSettings(settings: AppSettings) {
+  cacheSettings(settings);
   void api.saveSettings(settings).catch(() => {
     // 配置文件不可写时只保持当前会话设置。
   });
@@ -210,8 +231,12 @@ export async function initSettings() {
   if (initialized) return;
   initialized = true;
 
-  applySettings(defaults);
-  useSettingsStore.setState(defaults);
+  // 首帧用同步缓存（没有则用默认值）：settings.json 要走异步 IPC，
+  // 等它返回再应用主题会让「深色系统 + 浅色设置」闪一下深色。
+  const cached = readCachedSettings();
+  const first = cached ?? defaults;
+  applySettings(first);
+  useSettingsStore.setState(first);
 
   try {
     const stored = await api.loadSettings();
@@ -219,12 +244,14 @@ export async function initSettings() {
       const initial = normalizeSettings(stored);
       applySettings(initial);
       useSettingsStore.setState(initial);
+      cacheSettings(initial);
     } else {
       const legacy = readLegacySettings();
-      const initial = legacy ?? defaults;
+      const initial = legacy ?? first;
       applySettings(initial);
       useSettingsStore.setState(initial);
       await api.saveSettings(initial);
+      cacheSettings(initial);
     }
     try {
       localStorage.removeItem(LEGACY_STORAGE_KEY);
@@ -232,7 +259,7 @@ export async function initSettings() {
       // 旧缓存清理失败不影响设置文件。
     }
   } catch {
-    // 读取安装目录设置失败时使用默认值，保证界面可启动。
+    // 读取安装目录设置失败时使用缓存/默认值，保证界面可启动。
   }
 
   const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
